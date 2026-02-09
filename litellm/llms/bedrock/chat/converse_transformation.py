@@ -3,6 +3,7 @@ Translating between OpenAI's `/chat/completion` format and Amazon's `/converse` 
 """
 
 import copy
+import json
 import time
 import types
 from typing import List, Literal, Optional, Tuple, Union, cast, overload
@@ -1570,6 +1571,70 @@ class AmazonConverseConfig(BaseConfig):
 
         return content_str, tools, reasoningContentBlocks, citationsContentBlocks
 
+    def _filter_json_mode_tools(
+        self,
+        tools: List[ChatCompletionToolCallChunk],
+        json_mode: Optional[bool],
+        chat_completion_message: ChatCompletionResponseMessage,
+    ) -> Optional[List[ChatCompletionToolCallChunk]]:
+        """
+        Filter out json_tool_call from tools if json_mode is enabled.
+        Handles the case where both real tools and response_format are used together.
+
+        Returns None when json_tool_call was converted to content (caller should not set tool_calls).
+        Returns the (possibly filtered) list of tools otherwise.
+        """
+        if not (json_mode is True and tools):
+            return tools  # No filtering needed, return as-is (including empty list)
+
+        # Check if json_tool_call is present
+        json_tool_call_index = None
+        for idx, tool in enumerate(tools):
+            if tool["function"].get("name") == RESPONSE_FORMAT_TOOL_NAME:
+                json_tool_call_index = idx
+                break
+
+        if json_tool_call_index is None:
+            return tools  # No json_tool_call found, return as-is
+
+        # If json_tool_call is the ONLY tool, convert it to content (existing behavior)
+        if len(tools) == 1:
+            verbose_logger.debug(
+                "Processing JSON tool call response for response_format (single tool)"
+            )
+            json_mode_content_str: Optional[str] = tools[0]["function"].get(
+                "arguments"
+            )
+            if json_mode_content_str is not None:
+                # Bedrock returns the response wrapped in a "properties" object
+                # We need to extract the actual content from this wrapper
+                try:
+                    response_data = json.loads(json_mode_content_str)
+
+                    # If Bedrock wrapped the response in "properties", extract the content
+                    if (
+                        isinstance(response_data, dict)
+                        and "properties" in response_data
+                        and len(response_data) == 1
+                    ):
+                        response_data = response_data["properties"]
+                        json_mode_content_str = json.dumps(response_data)
+                except json.JSONDecodeError:
+                    # If parsing fails, use the original response
+                    pass
+
+                chat_completion_message["content"] = json_mode_content_str
+            return None  # Signal: don't set tool_calls
+
+        # Multiple tools with json_tool_call present: filter it out
+        verbose_logger.debug(
+            "Filtering out %s from tool calls (multiple tools present)",
+            RESPONSE_FORMAT_TOOL_NAME,
+        )
+        return [
+            tool for idx, tool in enumerate(tools) if idx != json_tool_call_index
+        ]
+
     def _transform_response(  # noqa: PLR0915
         self,
         model: str,
@@ -1592,7 +1657,7 @@ class AmazonConverseConfig(BaseConfig):
                 additional_args={"complete_input_dict": data},
             )
 
-        json_mode: Optional[bool] = optional_params.pop("json_mode", None)
+        json_mode: Optional[bool] = optional_params.get("json_mode", None)
         ## RESPONSE OBJECT
         try:
             completion_response = ConverseResponseBlock(**response.json())  # type: ignore
@@ -1676,39 +1741,18 @@ class AmazonConverseConfig(BaseConfig):
                 "thinking_blocks"
             ] = self._transform_thinking_blocks(reasoningContentBlocks)
         chat_completion_message["content"] = content_str
-        if (
-            json_mode is True
-            and tools is not None
-            and len(tools) == 1
-            and tools[0]["function"].get("name") == RESPONSE_FORMAT_TOOL_NAME
-        ):
-            verbose_logger.debug(
-                "Processing JSON tool call response for response_format"
-            )
-            json_mode_content_str: Optional[str] = tools[0]["function"].get("arguments")
-            if json_mode_content_str is not None:
-                import json
 
-                # Bedrock returns the response wrapped in a "properties" object
-                # We need to extract the actual content from this wrapper
-                try:
-                    response_data = json.loads(json_mode_content_str)
+        # Filter out json_tool_call from tools if json_mode is enabled
+        filtered_tools = self._filter_json_mode_tools(
+            tools=tools,
+            json_mode=json_mode,
+            chat_completion_message=chat_completion_message,
+        )
 
-                    # If Bedrock wrapped the response in "properties", extract the content
-                    if (
-                        isinstance(response_data, dict)
-                        and "properties" in response_data
-                        and len(response_data) == 1
-                    ):
-                        response_data = response_data["properties"]
-                        json_mode_content_str = json.dumps(response_data)
-                except json.JSONDecodeError:
-                    # If parsing fails, use the original response
-                    pass
-
-                chat_completion_message["content"] = json_mode_content_str
-        else:
-            chat_completion_message["tool_calls"] = tools
+        # None means json_tool_call was the only tool and was converted to content.
+        # Otherwise set tool_calls (including empty list, preserving original behavior).
+        if filtered_tools is not None:
+            chat_completion_message["tool_calls"] = filtered_tools
 
         ## CALCULATING USAGE - bedrock returns usage in the headers
         usage = self._transform_usage(completion_response["usage"])

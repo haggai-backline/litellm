@@ -740,6 +740,345 @@ def test_transform_response_with_structured_response_calling_tool():
     assert result.choices[0].message.tool_calls[0].function.arguments == '{"location": "San Francisco, CA", "unit": "celsius"}'
 
 
+def test_transform_response_with_both_json_tool_call_and_real_tool():
+    """Test response transformation when Bedrock returns BOTH json_tool_call and real tool.
+
+    This is the bug scenario reported in issue #18381.
+    When both tools and response_format are used together, Bedrock may return both:
+    - json_tool_call (fake tool added by LiteLLM for structured output)
+    - get_weather (real tool)
+
+    The fix should filter out json_tool_call and only return the real tool.
+
+    Related issue: https://github.com/BerriAI/litellm/issues/18381
+    """
+    from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
+    from litellm.types.utils import ModelResponse
+
+    response_json = {
+        "metrics": {"latencyMs": 1148},
+        "output": {
+            "message": {
+                "content": [
+                    {
+                        "toolUse": {
+                            "input": {
+                                "message": "I'll check the weather for you",
+                                "location_ids": ["san-francisco"],
+                            },
+                            "name": "json_tool_call",
+                            "toolUseId": "tooluse_json_123",
+                        }
+                    },
+                    {
+                        "toolUse": {
+                            "input": {
+                                "location": "San Francisco, CA",
+                                "unit": "celsius",
+                            },
+                            "name": "get_weather",
+                            "toolUseId": "tooluse_real_456",
+                        }
+                    },
+                ],
+                "role": "assistant",
+            }
+        },
+        "stopReason": "tool_use",
+        "usage": {
+            "cacheReadInputTokenCount": 0,
+            "cacheReadInputTokens": 0,
+            "cacheWriteInputTokenCount": 0,
+            "cacheWriteInputTokens": 0,
+            "inputTokens": 534,
+            "outputTokens": 69,
+            "totalTokens": 603,
+        },
+    }
+
+    class MockResponse:
+        def json(self):
+            return response_json
+
+        @property
+        def text(self):
+            return json.dumps(response_json)
+
+    config = AmazonConverseConfig()
+    model_response = ModelResponse()
+    optional_params = {
+        "json_mode": True,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state, e.g. San Francisco, CA",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "json_tool_call",
+                    "parameters": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "required": ["message", "location_ids"],
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Response message",
+                            },
+                            "location_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of location IDs",
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ],
+    }
+
+    result = config._transform_response(
+        model="bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        response=MockResponse(),
+        model_response=model_response,
+        stream=False,
+        logging_obj=None,
+        optional_params=optional_params,
+        api_key=None,
+        data=None,
+        messages=[],
+        encoding=None,
+    )
+
+    # Verify that ONLY the real tool is returned (json_tool_call should be filtered out)
+    assert result.choices[0].message.tool_calls is not None
+    assert len(result.choices[0].message.tool_calls) == 1
+    assert result.choices[0].message.tool_calls[0].function.name == "get_weather"
+    assert (
+        result.choices[0].message.tool_calls[0].function.arguments
+        == '{"location": "San Francisco, CA", "unit": "celsius"}'
+    )
+
+    # Verify json_tool_call is NOT in the response
+    tool_names = [tc.function.name for tc in result.choices[0].message.tool_calls]
+    assert "json_tool_call" not in tool_names
+
+    # Verify optional_params still contains json_mode (not popped)
+    assert "json_mode" in optional_params
+
+
+def test_transform_response_does_not_mutate_optional_params():
+    """Verify that _transform_response does not pop json_mode from optional_params.
+
+    Callers may reuse optional_params after response transformation (e.g. for
+    logging, retries, or metrics), so mutating it is a side-effect bug.
+    """
+    from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
+    from litellm.types.utils import ModelResponse
+
+    response_json = {
+        "metrics": {"latencyMs": 100},
+        "output": {
+            "message": {
+                "content": [{"text": "Hello"}],
+                "role": "assistant",
+            }
+        },
+        "stopReason": "end_turn",
+        "usage": {
+            "cacheReadInputTokenCount": 0,
+            "cacheReadInputTokens": 0,
+            "cacheWriteInputTokenCount": 0,
+            "cacheWriteInputTokens": 0,
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "totalTokens": 15,
+        },
+    }
+
+    class MockResponse:
+        def json(self):
+            return response_json
+
+        @property
+        def text(self):
+            return json.dumps(response_json)
+
+    config = AmazonConverseConfig()
+    optional_params = {"json_mode": True, "some_other_key": "value"}
+
+    config._transform_response(
+        model="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
+        response=MockResponse(),
+        model_response=ModelResponse(),
+        stream=False,
+        logging_obj=None,
+        optional_params=optional_params,
+        api_key=None,
+        data=None,
+        messages=[],
+        encoding=None,
+    )
+
+    assert "json_mode" in optional_params, "json_mode should not be popped from optional_params"
+    assert optional_params["json_mode"] is True
+
+
+def test_streaming_decoder_filters_json_tool_call():
+    """Test that AWSEventStreamDecoder filters out json_tool_call in streaming mode.
+
+    When json_mode=True and the stream contains both json_tool_call and real tool
+    chunks, the decoder should suppress json_tool_call and convert its arguments
+    to text content. Only real tools should appear in tool_calls.
+
+    Related issue: https://github.com/BerriAI/litellm/issues/18381
+    """
+    from litellm.llms.bedrock.chat.invoke_handler import AWSEventStreamDecoder
+
+    decoder = AWSEventStreamDecoder(model="us.anthropic.claude-sonnet-4-5-20250929-v1:0", json_mode=True)
+
+    # Simulate stream: messageStart -> json_tool_call start -> json_tool_call delta -> stop
+    #                 -> real tool start -> real tool delta -> stop -> stopReason
+
+    chunks = [
+        # 1. messageStart
+        {"messageStart": {"role": "assistant", "conversationId": "conv-123"}},
+        # 2. json_tool_call start (should be suppressed)
+        {
+            "contentBlockIndex": 0,
+            "start": {
+                "toolUse": {
+                    "toolUseId": "tooluse_json_001",
+                    "name": "json_tool_call",
+                }
+            },
+        },
+        # 3. json_tool_call delta (should become text content)
+        {
+            "contentBlockIndex": 0,
+            "delta": {
+                "toolUse": {
+                    "input": '{"message": "checking weather"}',
+                }
+            },
+        },
+        # 4. json_tool_call stop
+        {"contentBlockIndex": 0},
+        # 5. Real tool start
+        {
+            "contentBlockIndex": 1,
+            "start": {
+                "toolUse": {
+                    "toolUseId": "tooluse_real_002",
+                    "name": "get_weather",
+                }
+            },
+        },
+        # 6. Real tool delta
+        {
+            "contentBlockIndex": 1,
+            "delta": {
+                "toolUse": {
+                    "input": '{"location": "San Francisco"}',
+                }
+            },
+        },
+        # 7. Real tool stop
+        {"contentBlockIndex": 1},
+        # 8. Stop reason
+        {"stopReason": "tool_use"},
+    ]
+
+    responses = [decoder.converse_chunk_parser(chunk) for chunk in chunks]
+
+    # Collect all tool_calls and text content from the stream
+    all_tool_calls = []
+    all_text = []
+    for resp in responses:
+        if resp.choices and resp.choices[0].delta:
+            delta = resp.choices[0].delta
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    if tc.function and tc.function.name:
+                        all_tool_calls.append(tc)
+            if delta.content:
+                all_text.append(delta.content)
+
+    # Only real tool should appear in tool_calls
+    assert len(all_tool_calls) == 1, f"Expected 1 tool call, got {len(all_tool_calls)}"
+    assert all_tool_calls[0].function.name == "get_weather"
+
+    # json_tool_call arguments should be converted to text content
+    combined_text = "".join(all_text)
+    assert "checking weather" in combined_text
+
+
+def test_streaming_decoder_without_json_mode_passes_all_tools():
+    """Test that AWSEventStreamDecoder passes all tools through when json_mode=False.
+
+    When json_mode is not enabled, all tools (including any named json_tool_call)
+    should pass through unfiltered.
+    """
+    from litellm.llms.bedrock.chat.invoke_handler import AWSEventStreamDecoder
+
+    decoder = AWSEventStreamDecoder(model="us.anthropic.claude-sonnet-4-5-20250929-v1:0", json_mode=False)
+
+    chunks = [
+        {"messageStart": {"role": "assistant", "conversationId": "conv-456"}},
+        {
+            "contentBlockIndex": 0,
+            "start": {
+                "toolUse": {
+                    "toolUseId": "tooluse_001",
+                    "name": "json_tool_call",
+                }
+            },
+        },
+        {
+            "contentBlockIndex": 0,
+            "delta": {
+                "toolUse": {
+                    "input": '{"data": "test"}',
+                }
+            },
+        },
+        {"contentBlockIndex": 0},
+        {"stopReason": "tool_use"},
+    ]
+
+    responses = [decoder.converse_chunk_parser(chunk) for chunk in chunks]
+
+    # All tools should pass through when json_mode=False
+    all_tool_calls = []
+    for resp in responses:
+        if resp.choices and resp.choices[0].delta and resp.choices[0].delta.tool_calls:
+            for tc in resp.choices[0].delta.tool_calls:
+                if tc.function and tc.function.name:
+                    all_tool_calls.append(tc)
+
+    assert len(all_tool_calls) == 1
+    assert all_tool_calls[0].function.name == "json_tool_call"
+
+
 @pytest.mark.asyncio
 async def test_bedrock_bash_tool_acompletion():
     """Test Bedrock with bash tool for ls command using acompletion."""
